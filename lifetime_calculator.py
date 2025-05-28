@@ -5,10 +5,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from io import BytesIO
 import logging
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
+import re
+import json
 
 # Настройка страницы
 st.set_page_config(
@@ -56,6 +59,14 @@ st.markdown("""
         padding: 1rem;
         margin: 1rem 0;
     }
+    
+    .sheets-card {
+        background: linear-gradient(135deg, #4285f4 0%, #34a853 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -68,6 +79,45 @@ class LifetimeCalculator:
     
     def __init__(self):
         self.retention_keywords = ['retention', '%', 'ret', 'удержан', 'остал', 'процент']
+    
+    @st.cache_data
+    def load_from_google_sheets(_self, sheet_url: str, sheet_name: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
+        """Загрузка данных напрямую из Google Sheets по ссылке."""
+        try:
+            # Проверяем формат ссылки
+            if 'docs.google.com/spreadsheets' not in sheet_url:
+                return pd.DataFrame(), "Некорректная ссылка на Google Sheets"
+            
+            # Извлекаем ID из URL
+            sheet_id_match = re.search(r'/d/([a-zA-Z0-9-_]+)', sheet_url)
+            if not sheet_id_match:
+                return pd.DataFrame(), "Не удалось извлечь ID из ссылки"
+            
+            sheet_id = sheet_id_match.group(1)
+            
+            # Формируем URL для экспорта в CSV
+            if sheet_name:
+                csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+            else:
+                csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+            
+            # Загружаем данные
+            response = requests.get(csv_url, timeout=10)
+            response.raise_for_status()
+            
+            # Парсим CSV
+            from io import StringIO
+            df = pd.read_csv(StringIO(response.text))
+            
+            if df.empty:
+                return pd.DataFrame(), "Google Sheets пустая или недоступна"
+            
+            return df, "success"
+            
+        except requests.RequestException as e:
+            return pd.DataFrame(), f"Ошибка загрузки из Google Sheets: {str(e)}"
+        except Exception as e:
+            return pd.DataFrame(), f"Общая ошибка: {str(e)}"
     
     @st.cache_data
     def read_file(_self, file_data) -> Tuple[pd.DataFrame, str]:
@@ -257,23 +307,26 @@ def get_calculator():
 
 calculator = get_calculator()
 
-def create_plotly_charts(metrics: Dict) -> Tuple[Any, Any, Any]:
-    """Создает интерактивные графики с Plotly."""
+def create_advanced_plotly_charts(metrics: Dict) -> Tuple[Any, Any, Any, Any]:
+    """Создает продвинутые интерактивные графики с Plotly."""
     retention = metrics['retention']
     cumulative_ltv = metrics['cumulative_ltv']
     monthly_ltv = metrics['monthly_ltv']
     
     months = list(range(1, len(retention) + 1))
     
-    # График 1: Retention кривая
+    # График 1: Retention кривая с прогнозом
     fig_retention = go.Figure()
+    
+    # Основная кривая retention
     fig_retention.add_trace(go.Scatter(
         x=months, 
         y=retention,
         mode='lines+markers',
-        name='Retention %',
+        name='Retention (факт)',
         line=dict(color='#667eea', width=3),
-        marker=dict(size=8)
+        marker=dict(size=8),
+        hovertemplate='Месяц %{x}<br>Retention: %{y:.2%}<extra></extra>'
     ))
     
     # Добавляем прогноз если есть
@@ -285,18 +338,22 @@ def create_plotly_charts(metrics: Dict) -> Tuple[Any, Any, Any]:
             mode='lines+markers',
             name='Прогноз retention',
             line=dict(color='#ff7f0e', width=2, dash='dash'),
-            marker=dict(size=6)
+            marker=dict(size=6),
+            hovertemplate='Месяц %{x}<br>Прогноз: %{y:.2%}<extra></extra>'
         ))
     
     fig_retention.update_layout(
-        title="Кривая удержания пользователей",
+        title="Кривая удержания пользователей с прогнозом",
         xaxis_title="Месяц",
-        yaxis_title="Retention (доля)",
-        hovermode='x unified'
+        yaxis_title="Retention",
+        hovermode='x unified',
+        yaxis=dict(tickformat='.1%')
     )
     
-    # График 2: Рост LTV
+    # График 2: Комбинированный LTV с зонами
     fig_ltv = go.Figure()
+    
+    # Основная кривая LTV
     fig_ltv.add_trace(go.Scatter(
         x=months,
         y=cumulative_ltv,
@@ -304,48 +361,122 @@ def create_plotly_charts(metrics: Dict) -> Tuple[Any, Any, Any]:
         name='Кумулятивный LTV',
         line=dict(color='#2ca02c', width=3),
         marker=dict(size=8),
-        fill='tonexty'
+        fill='tonexty',
+        hovertemplate='Месяц %{x}<br>LTV: %{y:,.0f} ₽<extra></extra>'
     ))
     
+    # Линия CAC для сравнения
+    if 'ltv_cac' in metrics and metrics['ltv_cac'] > 0:
+        cac_line = [metrics['ltv'] / metrics['ltv_cac']] * len(months)
+        fig_ltv.add_trace(go.Scatter(
+            x=months,
+            y=cac_line,
+            mode='lines',
+            name='CAC',
+            line=dict(color='red', width=2, dash='dot'),
+            hovertemplate='CAC: %{y:,.0f} ₽<extra></extra>'
+        ))
+    
     fig_ltv.update_layout(
-        title="Накопление LTV по месяцам",
-        xaxis_title="Месяц", 
+        title="Накопление LTV vs CAC",
+        xaxis_title="Месяц",
         yaxis_title="LTV (руб.)",
         hovermode='x unified'
     )
     
-    # График 3: Месячный LTV
+    # График 3: Месячный LTV с трендом
     fig_monthly = go.Figure()
+    
     fig_monthly.add_trace(go.Bar(
         x=months,
         y=monthly_ltv,
         name='Месячный LTV',
-        marker_color='#764ba2'
+        marker_color='#764ba2',
+        hovertemplate='Месяц %{x}<br>LTV: %{y:,.0f} ₽<extra></extra>'
     ))
     
+    # Тренд линия
+    if len(monthly_ltv) > 3:
+        z = np.polyfit(months, monthly_ltv, 1)
+        p = np.poly1d(z)
+        fig_monthly.add_trace(go.Scatter(
+            x=months,
+            y=p(months),
+            mode='lines',
+            name='Тренд',
+            line=dict(color='red', width=2),
+            hovertemplate='Тренд: %{y:,.0f} ₽<extra></extra>'
+        ))
+    
     fig_monthly.update_layout(
-        title="Месячный вклад в LTV",
+        title="Месячный вклад в LTV с трендом",
         xaxis_title="Месяц",
         yaxis_title="LTV за месяц (руб.)",
         hovermode='x unified'
     )
     
-    return fig_retention, fig_ltv, fig_monthly
+    # График 4: Тепловая карта чувствительности
+    fig_sensitivity = create_sensitivity_heatmap(metrics)
+    
+    return fig_retention, fig_ltv, fig_monthly, fig_sensitivity
 
-def export_results_to_excel(metrics: Dict, sensitivity_df: pd.DataFrame, filename: str = "ltv_analysis.xlsx"):
-    """Экспорт результатов в Excel."""
+def create_sensitivity_heatmap(metrics: Dict) -> go.Figure:
+    """Создает тепловую карту чувствительности LTV/CAC."""
+    try:
+        base_ltv = metrics['ltv']
+        base_cac = base_ltv / metrics['ltv_cac'] if metrics['ltv_cac'] > 0 else 100
+        
+        # Диапазоны изменений
+        cac_changes = np.linspace(0.5, 2.0, 10)
+        arppu_changes = np.linspace(0.7, 1.5, 10)
+        
+        # Матрица LTV/CAC
+        ltv_cac_matrix = []
+        for arppu_change in arppu_changes:
+            row = []
+            for cac_change in cac_changes:
+                new_ltv = base_ltv * arppu_change
+                new_cac = base_cac * cac_change
+                ltv_cac_ratio = new_ltv / new_cac if new_cac > 0 else 0
+                row.append(ltv_cac_ratio)
+            ltv_cac_matrix.append(row)
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=ltv_cac_matrix,
+            x=[f"{c:.1f}x" for c in cac_changes],
+            y=[f"{a:.1f}x" for a in arppu_changes],
+            colorscale='RdYlGn',
+            colorbar=dict(title="LTV/CAC"),
+            hovertemplate='CAC: %{x}<br>ARPPU: %{y}<br>LTV/CAC: %{z:.2f}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Тепловая карта чувствительности LTV/CAC",
+            xaxis_title="Изменение CAC",
+            yaxis_title="Изменение ARPPU"
+        )
+        
+        return fig
+    
+    except Exception as e:
+        logger.error(f"Ошибка создания тепловой карты: {str(e)}")
+        return go.Figure()
+
+def export_results_to_excel_advanced(metrics: Dict, sensitivity_df: pd.DataFrame, insights: List[Dict] = None) -> bytes:
+    """Расширенный экспорт результатов в Excel с дополнительными листами."""
     output = BytesIO()
     
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         # Основные метрики
         main_metrics = pd.DataFrame({
-            'Метрика': ['Lifetime (мес)', 'LTV (руб)', 'LTV/CAC', 'ROI (%)', 'Период окупаемости (мес)'],
+            'Метрика': ['Lifetime (мес)', 'LTV (руб)', 'LTV/CAC', 'ROI (%)', 'Период окупаемости (мес)', 'Прогноз LTV (руб)'],
             'Значение': [
                 round(metrics['lifetime'], 2),
                 round(metrics['ltv'], 0),
                 round(metrics['ltv_cac'], 2),
                 round(metrics['roi_percent'], 1),
-                metrics['payback_period'] or 'Не окупается'
+                metrics['payback_period'] or 'Не окупается',
+                round(metrics.get('extended_ltv', metrics['ltv']), 0)
             ]
         })
         main_metrics.to_excel(writer, sheet_name='Основные метрики', index=False)
@@ -361,17 +492,175 @@ def export_results_to_excel(metrics: Dict, sensitivity_df: pd.DataFrame, filenam
         monthly_data.to_excel(writer, sheet_name='Помесячные данные', index=False)
         
         # Анализ чувствительности
-        sensitivity_df.to_excel(writer, sheet_name='Анализ чувствительности', index=False)
+        if not sensitivity_df.empty:
+            sensitivity_df.to_excel(writer, sheet_name='Анализ чувствительности', index=False)
         
         # Прогноз
-        if len(metrics['future_retention']) > 0:
+        if len(metrics.get('future_retention', [])) > 0:
             forecast_data = pd.DataFrame({
                 'Месяц': range(len(metrics['retention']) + 1, len(metrics['retention']) + len(metrics['future_retention']) + 1),
-                'Прогноз Retention': metrics['future_retention'].round(4)
+                'Прогноз Retention': metrics['future_retention'].round(4),
+                'Прогноз месячного LTV': (metrics['future_retention'] * (metrics['ltv'] / metrics['lifetime'])).round(0)
             })
             forecast_data.to_excel(writer, sheet_name='Прогноз', index=False)
+        
+        # Инсайты (если переданы)
+        if insights:
+            insights_df = pd.DataFrame([
+                {
+                    'Тип': insight.get('type', 'info'),
+                    'Заголовок': insight.get('title', ''),
+                    'Описание': insight.get('description', ''),
+                    'Рекомендация': insight.get('recommendation', '')
+                }
+                for insight in insights
+            ])
+            insights_df.to_excel(writer, sheet_name='Инсайты', index=False)
+        
+        # Сводка для руководства
+        summary_data = pd.DataFrame({
+            'Показатель': [
+                'Время жизни клиента',
+                'Доходность клиента',
+                'Окупаемость маркетинга',
+                'Статус модели',
+                'Рекомендация'
+            ],
+            'Значение': [
+                f"{metrics['lifetime']:.1f} месяцев",
+                f"{metrics['ltv']:,.0f} рублей",
+                f"{metrics['ltv_cac']:.1f}x возврат инвестиций",
+                "Прибыльная" if metrics['ltv_cac'] > 1 else "Убыточная",
+                "Масштабировать" if metrics['ltv_cac'] > 3 else "Оптимизировать" if metrics['ltv_cac'] > 1 else "Пересмотреть стратегию"
+            ]
+        })
+        summary_data.to_excel(writer, sheet_name='Сводка для руководства', index=False)
     
     return output.getvalue()
+
+def render_data_source_selector() -> Tuple[Optional[pd.DataFrame], str]:
+    """Рендерит селектор источника данных и возвращает загруженные данные."""
+    
+    # Выбор источника данных
+    data_source = st.selectbox(
+        "📊 Источник данных:",
+        ["📁 Загрузить файл", "🔗 Google Sheets", "📝 Ручной ввод"]
+    )
+    
+    df = None
+    source_info = ""
+    
+    if data_source == "📁 Загрузить файл":
+        uploaded_file = st.file_uploader(
+            "Загрузите файл с retention данными",
+            type=['csv', 'xlsx', 'xls']
+        )
+        
+        if uploaded_file:
+            df, status = calculator.read_file(uploaded_file)
+            if status == "success":
+                st.success("✅ Файл загружен успешно!")
+                source_info = f"Файл: {uploaded_file.name}"
+            else:
+                st.error(f"❌ {status}")
+    
+    elif data_source == "🔗 Google Sheets":
+        st.markdown("""
+        <div class="sheets-card">
+            <h4>🔗 Загрузка из Google Sheets</h4>
+            <p>Введите ссылку на вашу Google Таблицу с данными retention</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            sheets_url = st.text_input(
+                "Ссылка на Google Sheets:",
+                placeholder="https://docs.google.com/spreadsheets/d/1ABC123.../edit"
+            )
+        
+        with col2:
+            sheet_name = st.text_input(
+                "Лист (опционально):",
+                placeholder="Лист1"
+            )
+        
+        if sheets_url:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("📥 Загрузить данные", type="primary"):
+                    with st.spinner("Загружаем данные из Google Sheets..."):
+                        df, status = calculator.load_from_google_sheets(sheets_url, sheet_name or None)
+                        
+                        if status == "success":
+                            st.success("✅ Данные успешно загружены из Google Sheets!")
+                            source_info = f"Google Sheets: {sheet_name or 'первый лист'}"
+                            
+                            # Сохраняем в session_state для повторного использования
+                            st.session_state['sheets_data'] = df
+                            st.session_state['sheets_url'] = sheets_url
+                            st.session_state['sheets_name'] = sheet_name
+                        else:
+                            st.error(f"❌ {status}")
+            
+            with col2:
+                if 'sheets_data' in st.session_state and st.button("🔄 Обновить данные"):
+                    with st.spinner("Обновляем данные..."):
+                        df, status = calculator.load_from_google_sheets(
+                            st.session_state['sheets_url'], 
+                            st.session_state.get('sheets_name')
+                        )
+                        if status == "success":
+                            st.session_state['sheets_data'] = df
+                            st.success("✅ Данные обновлены!")
+                        else:
+                            st.error(f"❌ {status}")
+        
+        # Показываем сохраненные данные
+        if 'sheets_data' in st.session_state:
+            df = st.session_state['sheets_data']
+            source_info = f"Google Sheets: {st.session_state.get('sheets_name', 'первый лист')}"
+    
+    elif data_source == "📝 Ручной ввод":
+        st.subheader("✏️ Введите данные retention")
+        
+        num_months = st.slider("Количество месяцев:", 6, 36, 12)
+        
+        # Создаем сетку для ввода данных
+        cols_per_row = 4
+        retention_values = []
+        
+        for row in range((num_months + cols_per_row - 1) // cols_per_row):
+            cols = st.columns(cols_per_row)
+            
+            for col_idx in range(cols_per_row):
+                month_idx = row * cols_per_row + col_idx
+                if month_idx < num_months:
+                    with cols[col_idx]:
+                        # Примерные значения с естественным убыванием
+                        default_value = max(1.0, 100 * (0.5 ** (month_idx/6)))
+                        
+                        value = st.number_input(
+                            f"Месяц {month_idx + 1}:",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=default_value,
+                            step=0.1,
+                            key=f"retention_{month_idx}"
+                        )
+                        retention_values.append(value)
+        
+        if st.button("✅ Применить введенные данные", type="primary"):
+            df = pd.DataFrame({
+                'Месяц': range(1, num_months + 1),
+                'Retention %': retention_values
+            })
+            st.success("✅ Данные введены вручную!")
+            source_info = f"Ручной ввод: {num_months} месяцев"
+    
+    return df, source_info
 
 def main():
     """Главная функция приложения."""
@@ -384,38 +673,28 @@ def main():
     with st.sidebar:
         st.header("⚙️ Настройки анализа")
         
-        # Загрузка файла
-        uploaded_file = st.file_uploader(
-            "📁 Загрузите файл с retention данными",
-            type=['csv', 'xlsx', 'xls'],
-            help="Поддерживаются форматы: CSV, Excel"
-        )
+        # Гибкий селектор источников данных
+        df, source_info = render_data_source_selector()
         
-        if uploaded_file:
-            # Чтение файла
-            df, status = calculator.read_file(uploaded_file)
+        if df is not None and not df.empty:
+            st.success(f"📊 **Источник**: {source_info}")
             
-            if status == "success":
-                st.success("✅ Файл загружен успешно!")
-                
-                # Предварительный просмотр данных
-                with st.expander("👀 Предварительный просмотр данных"):
-                    st.dataframe(df.head())
-                
-                # Выбор колонки
-                retention_col = st.selectbox(
-                    "📊 Колонка с retention данными",
-                    ["Автопоиск"] + list(df.columns),
-                    help="Выберите колонку с процентами удержания"
-                )
-                
-                if retention_col == "Автопоиск":
-                    retention_col = None
-            else:
-                st.error(f"❌ Ошибка загрузки: {status}")
-                return
+            # Предварительный просмотр данных
+            with st.expander("👀 Предварительный просмотр данных"):
+                st.dataframe(df.head(10))
+                st.info(f"Размер данных: {len(df)} строк, {len(df.columns)} колонок")
+            
+            # Выбор колонки
+            retention_col = st.selectbox(
+                "📊 Колонка с retention данными",
+                ["Автопоиск"] + list(df.columns),
+                help="Выберите колонку с процентами удержания"
+            )
+            
+            if retention_col == "Автопоиск":
+                retention_col = None
         else:
-            st.info("👆 Загрузите файл для начала анализа")
+            st.info("👆 Выберите источник данных для начала анализа")
             
             # Показываем пример данных
             st.markdown("### 📋 Пример формата данных:")
@@ -456,12 +735,13 @@ def main():
         
         show_forecast = st.checkbox("📈 Показать прогноз", value=True)
         show_sensitivity = st.checkbox("🎯 Анализ чувствительности", value=True)
+        show_heatmap = st.checkbox("🔥 Тепловая карта", value=True)
         
         # Кнопка расчета
         calculate_button = st.button("🚀 Рассчитать метрики", type="primary", use_container_width=True)
     
     # Основная область контента
-    if uploaded_file and calculate_button:
+    if df is not None and not df.empty and calculate_button:
         with st.spinner("⏳ Выполняем расчеты..."):
             # Поиск колонки retention
             col_name, col_status = calculator.find_retention_column(df, retention_col)
@@ -504,15 +784,19 @@ def main():
             )
         
         with col2:
+            delta_text = None
+            if show_forecast and 'extended_ltv' in metrics:
+                delta = metrics['extended_ltv'] - metrics['ltv']
+                delta_text = f"{delta:,.0f} ₽ прогноз"
+            
             st.metric(
                 "💎 LTV",
                 f"{metrics['ltv']:,.0f} ₽",
-                delta=f"{metrics['extended_ltv'] - metrics['ltv']:,.0f} ₽ прогноз" if show_forecast else None,
+                delta=delta_text,
                 help="Общий доход с одного клиента"
             )
         
         with col3:
-            ratio_color = "normal" if 1 <= metrics['ltv_cac'] <= 3 else ("inverse" if metrics['ltv_cac'] < 1 else "normal")
             st.metric(
                 "📈 LTV/CAC",
                 f"{metrics['ltv_cac']:.2f}",
@@ -532,18 +816,23 @@ def main():
         st.markdown("## 🎯 Интерпретация результатов")
         
         if metrics['ltv_cac'] < 1:
-            st.error("🔴 **Убыточная модель**: LTV < CAC. Требуется оптимизация привлечения или увеличение ARPPU.")
+            st.error("🔴 **Убыточная модель**: LTV < CAC. Требуется срочная оптимизация привлечения или увеличение ARPPU.")
+        elif metrics['ltv_cac'] < 2:
+            st.warning("🟡 **Окупается, но есть риски**: LTV/CAC < 2. Рекомендуется улучшение retention или снижение CAC.")
         elif metrics['ltv_cac'] < 3:
-            st.warning("🟡 **Окупается, но есть риски**: LTV/CAC = 1-3. Рекомендуется улучшение retention или снижение CAC.")
+            st.info("🔵 **Нормальная модель**: LTV/CAC = 2-3. Есть потенциал для дальнейшего роста.")
         else:
-            st.success("🟢 **Отличная модель**: LTV/CAC > 3. Можно масштабировать привлечение клиентов.")
+            st.success("🟢 **Отличная модель**: LTV/CAC > 3. Можно масштабировать привлечение клиентов!")
         
-        # Графики
-        st.markdown("## 📈 Визуализация данных")
+        # Продвинутые графики
+        st.markdown("## 📈 Продвинутая визуализация")
         
-        fig_retention, fig_ltv, fig_monthly = create_plotly_charts(metrics)
+        fig_retention, fig_ltv, fig_monthly, fig_sensitivity = create_advanced_plotly_charts(metrics)
         
-        tab1, tab2, tab3 = st.tabs(["📉 Retention кривая", "📈 Рост LTV", "📊 Месячный LTV"])
+        if show_heatmap:
+            tab1, tab2, tab3, tab4 = st.tabs(["📉 Retention", "📈 LTV Growth", "📊 Monthly LTV", "🔥 Heatmap"])
+        else:
+            tab1, tab2, tab3 = st.tabs(["📉 Retention", "📈 LTV Growth", "📊 Monthly LTV"])
         
         with tab1:
             st.plotly_chart(fig_retention, use_container_width=True)
@@ -553,6 +842,17 @@ def main():
         
         with tab3:
             st.plotly_chart(fig_monthly, use_container_width=True)
+        
+        if show_heatmap:
+            with tab4:
+                st.plotly_chart(fig_sensitivity, use_container_width=True)
+                st.markdown("""
+                **💡 Как читать тепловую карту:**
+                - **Зеленые зоны** — прибыльные сценарии (LTV/CAC > 1)
+                - **Красные зоны** — убыточные сценарии (LTV/CAC < 1)
+                - **По горизонтали** — изменение CAC (стоимости привлечения)
+                - **По вертикали** — изменение ARPPU (дохода с клиента)
+                """)
         
         # Детальные данные
         st.markdown("## 📋 Детальные данные")
@@ -576,26 +876,60 @@ def main():
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.subheader("📊 По CAC")
+                    st.subheader("📊 Чувствительность по CAC")
                     cac_data = sensitivity_df[sensitivity_df['Параметр'] == 'CAC']
                     st.dataframe(cac_data, use_container_width=True)
                 
                 with col2:
-                    st.subheader("📊 По ARPPU")
+                    st.subheader("📊 Чувствительность по ARPPU")
                     arppu_data = sensitivity_df[sensitivity_df['Параметр'] == 'ARPPU']
                     st.dataframe(arppu_data, use_container_width=True)
         
-        # Экспорт результатов
+        # Расширенный экспорт результатов
         st.markdown("## 💾 Экспорт результатов")
         
-        excel_data = export_results_to_excel(metrics, sensitivity_df if show_sensitivity else pd.DataFrame())
+        col1, col2 = st.columns(2)
         
-        st.download_button(
-            label="📥 Скачать Excel отчет",
-            data=excel_data,
-            file_name=f"ltv_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        with col1:
+            # Excel экспорт
+            excel_data = export_results_to_excel_advanced(
+                metrics, 
+                sensitivity_df if show_sensitivity else pd.DataFrame()
+            )
+            
+            st.download_button(
+                label="📥 Скачать полный отчет (Excel)",
+                data=excel_data,
+                file_name=f"ltv_analysis_full_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        
+        with col2:
+            # JSON экспорт для интеграций
+            json_data = {
+                'timestamp': datetime.now().isoformat(),
+                'source': source_info,
+                'parameters': {
+                    'arppu': arppu,
+                    'cac': cac
+                },
+                'metrics': {
+                    'lifetime': float(metrics['lifetime']),
+                    'ltv': float(metrics['ltv']),
+                    'ltv_cac': float(metrics['ltv_cac']),
+                    'roi_percent': float(metrics['roi_percent']),
+                    'payback_period': metrics['payback_period']
+                },
+                'retention_data': metrics['retention'].tolist(),
+                'forecast': metrics['future_retention'].tolist() if len(metrics['future_retention']) > 0 else []
+            }
+            
+            st.download_button(
+                label="📄 Скачать данные (JSON)",
+                data=json.dumps(json_data, ensure_ascii=False, indent=2),
+                file_name=f"ltv_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json"
+            )
     
     # Справочная информация
     with st.expander("📚 Справка по метрикам и методологии"):
@@ -620,8 +954,27 @@ def main():
         ### 🎯 Интерпретация LTV/CAC
         
         - **< 1.0** — Убыточная модель (тратим больше, чем зарабатываем)
-        - **1.0-3.0** — Окупается, но требует оптимизации
+        - **1.0-2.0** — Окупается, но есть риски
+        - **2.0-3.0** — Здоровая модель с потенциалом роста
         - **> 3.0** — Отличная модель для масштабирования
+        
+        ### 📊 Источники данных
+        
+        **📁 Файлы**: Поддерживаются CSV и Excel файлы с автоматическим определением кодировки
+        
+        **🔗 Google Sheets**: Прямая загрузка по ссылке
+        - Убедитесь, что доступ к таблице открыт
+        - Можно указать конкретный лист
+        - Поддерживается обновление данных
+        
+        **📝 Ручной ввод**: Интерактивный ввод данных retention по месяцам
+        
+        ### 🔥 Тепловая карта чувствительности
+        
+        Показывает, как изменения в ARPPU и CAC влияют на LTV/CAC:
+        - **Зеленый цвет** — прибыльные сценарии
+        - **Красный цвет** — убыточные сценарии
+        - Помогает планировать стратегию роста
         
         ### 📊 Рекомендации по улучшению
         
@@ -629,7 +982,7 @@ def main():
         - Улучшение retention (продуктовые фичи, engagement)
         - Увеличение ARPPU (upsell, cross-sell, ценообразование)
         
-        **For снижения CAC:**
+        **Для снижения CAC:**
         - Оптимизация рекламных каналов
         - Улучшение конверсии
         - Развитие органических каналов
