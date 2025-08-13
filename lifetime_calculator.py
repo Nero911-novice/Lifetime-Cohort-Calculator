@@ -273,7 +273,7 @@ class LifetimeCalculator:
                 ltv_cac_ratio = ltv / cac
                 sensitivity_data.append({
                     'Параметр': 'CAC',
-                    'Значение': int(cac),
+                    'Значение': round(cac, 2),
                     'LTV/CAC': round(ltv_cac_ratio, 2),
                     'ROI %': round((ltv_cac_ratio - 1) * 100, 1),
                     'Статус': 'Прибыльно' if ltv_cac_ratio > 1 else 'Убыточно',
@@ -287,7 +287,7 @@ class LifetimeCalculator:
                 ltv_cac_ratio = new_ltv / base_cac
                 sensitivity_data.append({
                     'Параметр': 'ARPPU',
-                    'Значение': int(arppu),
+                    'Значение': round(arppu, 2),
                     'LTV/CAC': round(ltv_cac_ratio, 2),
                     'ROI %': round((ltv_cac_ratio - 1) * 100, 1),
                     'Статус': 'Прибыльно' if ltv_cac_ratio > 1 else 'Убыточно',
@@ -395,21 +395,8 @@ def create_advanced_plotly_charts(metrics: Dict) -> Tuple[Any, Any, Any, Any]:
         hovertemplate='Месяц %{x}<br>LTV: %{y:,.0f} ₽<extra></extra>'
     ))
     
-    # Тренд линия
-    if len(monthly_ltv) > 3:
-        z = np.polyfit(months, monthly_ltv, 1)
-        p = np.poly1d(z)
-        fig_monthly.add_trace(go.Scatter(
-            x=months,
-            y=p(months),
-            mode='lines',
-            name='Тренд',
-            line=dict(color='red', width=2),
-            hovertemplate='Тренд: %{y:,.0f} ₽<extra></extra>'
-        ))
-    
     fig_monthly.update_layout(
-        title="Месячный вклад в LTV с трендом",
+        title="Месячный вклад в LTV",
         xaxis_title="Месяц",
         yaxis_title="LTV за месяц (руб.)",
         hovermode='x unified'
